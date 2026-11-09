@@ -1,0 +1,1230 @@
+=== FRONTEND FILE TREE
+\api.js
+\App.jsx
+\config.js
+\main.jsx
+\api\auth.js
+\api\client.js
+\api\socket.js
+\components\AdminLayout.jsx
+\components\AssistantChat.jsx
+\components\AuthShell.jsx
+\components\BookingConfirmation.jsx
+\components\DataTable.jsx
+\components\Feedback.jsx
+\components\FloorTabs.jsx
+\components\Footer.jsx
+\components\ForecastChart.jsx
+\components\Legend.jsx
+\components\Logo.jsx
+\components\Navbar.jsx
+\components\otp.css
+\components\OtpInput.jsx
+\components\PageHeader.jsx
+\components\ParkingLot.jsx
+\components\SlipButton.jsx
+\components\SlotBay.jsx
+\components\StatCard.jsx
+\components\StatusBadge.jsx
+\components\useCountdown.js
+\components\useLiveSlots.js
+\context\AuthContext.jsx
+\pages\BookSlot.jsx
+\pages\Dashboard.jsx
+\pages\ForgotPassword.jsx
+\pages\Landing.jsx
+\pages\Location.jsx
+\pages\Login.jsx
+\pages\MyBookings.jsx
+\pages\Predictions.jsx
+\pages\Register.jsx
+\pages\admin\AdminBookings.jsx
+\pages\admin\AdminOverview.jsx
+\pages\admin\AdminSensors.jsx
+\pages\admin\AdminSlots.jsx
+\pages\admin\AdminUsers.jsx
+\styles\global.css
+\utils\format.js
+\utils\slip.js
+=== FILE: F:\Parqco_third\parqco\backend\src\models\Booking.js
+import mongoose from 'mongoose';
+
+const bookingSchema = new mongoose.Schema(
+  {
+    user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    slot: { type: mongoose.Schema.Types.ObjectId, ref: 'Slot', required: true },
+    slotId: { type: String, required: true }, // copied from the slot for fast lookups
+    vehiclePlate: { type: String, trim: true, uppercase: true },
+    startTime: { type: Date, required: true },
+    endTime: { type: Date, required: true },
+    status: { type: String, enum: ['confirmed', 'completed', 'cancelled'], default: 'confirmed' },
+    amount: { type: Number, required: true, min: 0 },
+    challanNumber: { type: String, unique: true, sparse: true, trim: true },
+  },
+  { timestamps: true }
+);
+
+// Speeds up the "is this slot free between X and Y?" query
+bookingSchema.index({ slotId: 1, startTime: 1, endTime: 1 });
+bookingSchema.index({ vehiclePlate: 1, startTime: 1, endTime: 1 });
+
+export default mongoose.model('Booking', bookingSchema);
+=== FILE: F:\Parqco_third\parqco\backend\src\controllers\bookingController.js
+import mongoose from 'mongoose';
+import { z } from 'zod';
+import Booking from '../models/Booking.js';
+import Slot from '../models/Slot.js';
+import User from '../models/User.js';
+import { ApiError } from '../utils/ApiError.js';
+import { asyncHandler } from '../utils/asyncHandler.js';
+import { completeFinishedBookings } from '../services/slotStatus.js';
+import { broadcast } from '../sockets/io.js';
+import { normalizeVehicleNumber } from '../utils/vehicle.js';
+import { nextChallanNumber } from '../utils/challan.js';
+import { buildSlipData, buildSlipPdf } from '../utils/slip.js';
+import { slipEmailHtml } from '../utils/emailTemplates.js';
+import { isMailConfigured, sendMail } from '../utils/mailer.js';
+
+const MIN_BOOKING_MINUTES = 15;
+const MAX_BOOKING_HOURS = 24;
+const START_GRACE_MS = 5 * 60 * 1000; // a booking may start up to 5 minutes "in the past" (slow typing, clock drift)
+const HOUR_MS = 60 * 60 * 1000;
+
+const date = (message) => z.coerce.date({ errorMap: () => ({ message }) });
+
+export const bookingSchema = z
+  .object({
+    slotId: z.string().trim().min(1, 'Please choose a parking slot'),
+    startTime: date('Please choose a valid arrival time'),
+    endTime: date('Please choose a valid leaving time'),
+    vehiclePlate: z.string().trim().min(1, 'Please enter your vehicle registration number'),
+    driverName: z.string().trim().max(80).optional(), // defaults to the account name
+  })
+  .refine((data) => data.endTime > data.startTime, { message: 'End time must be after start time.', path: ['endTime'] });
+
+// ---------------------------------------------------------------- helpers
+
+function assertValidWindow(startTime, endTime) {
+  if (startTime.getTime() < Date.now() - START_GRACE_MS) throw new ApiError(400, 'Start time cannot be in the past.');
+  const minutes = (endTime - startTime) / 60000;
+  if (minutes < MIN_BOOKING_MINUTES) throw new ApiError(400, `The minimum booking is ${MIN_BOOKING_MINUTES} minutes.`);
+  if (minutes > MAX_BOOKING_HOURS * 60) throw new ApiError(400, `You can book up to ${MAX_BOOKING_HOURS} hours at a time.`);
+}
+
+/** Matches confirmed bookings that overlap the requested time window. */
+const overlapping = (startTime, endTime) => ({
+  status: 'confirmed',
+  startTime: { $lt: endTime },
+  endTime: { $gt: startTime },
+});
+
+/** Creates the booking together with its challan number; retries if two requests ever drew the same number. */
+async function createWithChallan(data) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await Booking.create({ ...data, challanNumber: await nextChallanNumber() });
+    } catch (error) {
+      const duplicateChallan = error.code === 11000 && error.keyPattern?.challanNumber;
+      if (!duplicateChallan || attempt >= 3) throw error;
+    }
+  }
+}
+
+/** E-mails the slip as a PDF. Runs in the background: a mail problem must never break a booking. */
+function emailSlipInBackground(slip, user) {
+  if (!user?.email || !isMailConfigured()) return;
+  (async () => {
+    const pdf = await buildSlipPdf(slip);
+    await sendMail({
+      to: user.email,
+      toName: user.name,
+      subject: `Parking slip ${slip.challanNumber}`,
+      html: slipEmailHtml(slip),
+      attachments: [{ filename: `Parking-Slip-${slip.challanNumber}.pdf`, content: pdf }],
+    });
+  })().catch((error) => console.error('[BOOKING] slip email failed:', error.message));
+}
+
+// ---------------------------------------------------------------- handlers
+
+/** POST /api/bookings - reserve a slot and receive the challan. */
+export const createBooking = asyncHandler(async (req, res) => {
+  const { slotId, startTime, endTime } = req.body;
+
+  const vehiclePlate = normalizeVehicleNumber(req.body.vehiclePlate);
+  if (!vehiclePlate) throw new ApiError(400, 'Please enter a valid vehicle registration number (e.g. LEA-1234).');
+  const driverName = req.body.driverName || req.user.name;
+
+  assertValidWindow(startTime, endTime);
+
+  // The slot must exist and be usable
+  const slot = await Slot.findOne({ slotId });
+  if (!slot) throw new ApiError(404, 'Parking slot not found.');
+  if (slot.status === 'maintenance') throw new ApiError(400, 'This slot is under maintenance.');
+  const now = new Date();
+  if (slot.status === 'occupied' && startTime <= now && endTime > now) {
+    throw new ApiError(409, 'This slot is occupied right now. Pick another slot or a later time.');
+  }
+
+  // One slot cannot be booked twice, and one vehicle cannot be in two places at once
+  const clash = overlapping(startTime, endTime);
+  if (await Booking.exists({ ...clash, slotId })) {
+    throw new ApiError(409, 'Someone just booked this slot for that time. Please pick another.');
+  }
+  if (await Booking.exists({ ...clash, vehiclePlate })) {
+    throw new ApiError(409, 'This vehicle already has a booking for that time.');
+  }
+
+  // Price is rounded up to the next full hour
+  const amount = Math.ceil((endTime - startTime) / HOUR_MS) * slot.hourlyRate;
+  const booking = await createWithChallan({
+    user: req.user._id,
+    slot: slot._id,
+    slotId,
+    driverName,
+    vehiclePlate,
+    startTime,
+    endTime,
+    amount,
+  });
+
+  // Race guard: if two requests passed the checks together, the earliest one wins
+  const winner = await Booking.findOne({ ...clash, slotId }).sort({ _id: 1 }).select('_id');
+  if (winner && !winner._id.equals(booking._id)) {
+    await Booking.deleteOne({ _id: booking._id });
+    throw new ApiError(409, 'Someone just booked this slot for that time. Please pick another.');
+  }
+
+  const slip = buildSlipData({ booking, user: req.user, slot });
+  emailSlipInBackground(slip, req.user);
+  broadcast('booking:update', { slotId });
+
+  res.status(201).json({
+    success: true,
+    message: 'Slot booked successfully.',
+    booking,
+    slip,
+    slipUrl: `/api/bookings/${booking._id}/slip`,
+  });
+});
+
+/** GET /api/bookings/my - the signed-in driver's bookings, newest first. */
+export const myBookings = asyncHandler(async (req, res) => {
+  await completeFinishedBookings();
+  const bookings = await Booking.find({ user: req.user._id }).sort({ startTime: -1 });
+  res.json({ success: true, bookings });
+});
+
+/** GET /api/bookings - admin: the 200 most recent bookings with the driver's account. */
+export const allBookings = asyncHandler(async (_req, res) => {
+  await completeFinishedBookings();
+  const bookings = await Booking.find().populate('user', 'name email').sort({ createdAt: -1 }).limit(200);
+  res.json({ success: true, bookings });
+});
+
+/** DELETE /api/bookings/:id - owner or admin cancels an upcoming booking. */
+export const cancelBooking = asyncHandler(async (req, res) => {
+  const booking = await Booking.findById(req.params.id);
+  if (!booking) throw new ApiError(404, 'Booking not found.');
+
+  const isOwner = booking.user.equals(req.user._id);
+  if (!isOwner && req.user.role !== 'admin') throw new ApiError(403, 'You can only cancel your own bookings.');
+  if (booking.status !== 'confirmed') throw new ApiError(400, `This booking is already ${booking.status}.`);
+
+  booking.status = 'cancelled';
+  await booking.save();
+  broadcast('booking:update', { slotId: booking.slotId });
+  res.json({ success: true, message: 'Booking cancelled.', booking });
+});
+
+/** GET /api/bookings/:id/slip - the PDF slip (add ?format=json for the raw data). Owner or admin only. */
+export const getSlip = asyncHandler(async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) throw new ApiError(400, 'Invalid booking id.');
+
+  let booking = await Booking.findById(req.params.id);
+  const isOwner = booking && booking.user.equals(req.user._id);
+  if (!booking || (!isOwner && req.user.role !== 'admin')) throw new ApiError(404, 'Booking not found.');
+
+  // Bookings made before challan numbers existed receive theirs the first time the slip is opened.
+  if (!booking.challanNumber) {
+    const challanNumber = await nextChallanNumber(booking.createdAt);
+    booking =
+      (await Booking.findOneAndUpdate(
+        { _id: booking._id, challanNumber: { $exists: false } },
+        { $set: { challanNumber } },
+        { new: true }
+      )) || (await Booking.findById(booking._id));
+  }
+
+  const [owner, slot] = await Promise.all([User.findById(booking.user), Slot.findOne({ slotId: booking.slotId })]);
+  const slip = buildSlipData({ booking, user: owner, slot });
+
+  if (req.query.format === 'json') return res.json({ success: true, slip });
+
+  const pdf = await buildSlipPdf(slip);
+  res.set({
+    'Content-Type': 'application/pdf',
+    'Content-Length': pdf.length,
+    'Content-Disposition': `inline; filename="Parking-Slip-${slip.challanNumber}.pdf"`,
+    'Cache-Control': 'private, no-store',
+  });
+  res.send(pdf);
+});
+=== FILE: F:\Parqco_third\parqco\frontend\src\api.js
+// Kept so older imports ("../api.js") still work. New code imports "./api/client.js".
+export { default } from './api/client.js';
+=== FILE: F:\Parqco_third\parqco\frontend\src\api\client.js
+import axios from 'axios';
+
+// In development the Vite dev server proxies "/api" to the backend, so VITE_API_URL stays empty.
+// In production set VITE_API_URL to the public address of the backend (no trailing slash).
+export const API_URL = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
+
+// One configured axios instance. Every request automatically carries the login token.
+const api = axios.create({ baseURL: `${API_URL}/api` });
+
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem('parqco_token');
+  if (token) config.headers.Authorization = `Bearer ${token}`;
+  return config;
+});
+
+export default api;
+=== FILE: F:\Parqco_third\parqco\frontend\src\App.jsx
+import { Navigate, Outlet, Route, Routes } from 'react-router-dom';
+import { useAuth } from './context/AuthContext.jsx';
+import Navbar from './components/Navbar.jsx';
+import Footer from './components/Footer.jsx';
+import AdminLayout from './components/AdminLayout.jsx';
+import Landing from './pages/Landing.jsx';
+import Login from './pages/Login.jsx';
+import Register from './pages/Register.jsx';
+import ForgotPassword from './pages/ForgotPassword.jsx';
+import Dashboard from './pages/Dashboard.jsx';
+import BookSlot from './pages/BookSlot.jsx';
+import MyBookings from './pages/MyBookings.jsx';
+import Predictions from './pages/Predictions.jsx';
+import AdminOverview from './pages/admin/AdminOverview.jsx';
+import AdminSlots from './pages/admin/AdminSlots.jsx';
+import AdminBookings from './pages/admin/AdminBookings.jsx';
+import AdminUsers from './pages/admin/AdminUsers.jsx';
+import AdminSensors from './pages/admin/AdminSensors.jsx';
+
+/** Blocks a page until the user is signed in (and has the right role, if one is required). */
+function RequireAuth({ role }) {
+  const { user, loading } = useAuth();
+  if (loading) return <div className="page-loading">Loading…</div>;
+  if (!user) return <Navigate to="/login" replace />;
+  if (role && user.role !== role) return <Navigate to="/dashboard" replace />;
+  return <Outlet />;
+}
+
+/** Layout for normal pages: top navigation + footer. */
+function SiteLayout() {
+  return (
+    <>
+      <Navbar />
+      <main>
+        <Outlet />
+      </main>
+      <Footer />
+    </>
+  );
+}
+
+export default function App() {
+  return (
+    <Routes>
+      <Route element={<SiteLayout />}>
+        <Route path="/" element={<Landing />} />
+        <Route element={<RequireAuth />}>
+          <Route path="/dashboard" element={<Dashboard />} />
+          <Route path="/book" element={<BookSlot />} />
+          <Route path="/bookings" element={<MyBookings />} />
+          <Route path="/predictions" element={<Predictions />} />
+        </Route>
+      </Route>
+
+      <Route path="/login" element={<Login />} />
+      <Route path="/register" element={<Register />} />
+      <Route path="/forgot-password" element={<ForgotPassword />} />
+
+      <Route element={<RequireAuth role="admin" />}>
+        <Route element={<AdminLayout />}>
+          <Route path="/admin" element={<AdminOverview />} />
+          <Route path="/admin/slots" element={<AdminSlots />} />
+          <Route path="/admin/bookings" element={<AdminBookings />} />
+          <Route path="/admin/users" element={<AdminUsers />} />
+          <Route path="/admin/sensors" element={<AdminSensors />} />
+        </Route>
+      </Route>
+
+      <Route path="*" element={<Navigate to="/" replace />} />
+    </Routes>
+  );
+}
+=== FILE: F:\Parqco_third\parqco\frontend\src\components\AdminLayout.jsx
+import { NavLink, Outlet, useNavigate } from 'react-router-dom';
+import { LayoutDashboard, ParkingSquare, CalendarCheck, Users, Radio, ArrowLeft, LogOut } from 'lucide-react';
+import Logo from './Logo.jsx';
+import { useAuth } from '../context/AuthContext.jsx';
+
+const adminLinks = [
+  { to: '/admin', label: 'Overview', icon: LayoutDashboard, end: true },
+  { to: '/admin/slots', label: 'Parking slots', icon: ParkingSquare },
+  { to: '/admin/bookings', label: 'Bookings', icon: CalendarCheck },
+  { to: '/admin/users', label: 'Users', icon: Users },
+  { to: '/admin/sensors', label: 'Sensors', icon: Radio },
+];
+
+export default function AdminLayout() {
+  const { user, logout } = useAuth();
+  const navigate = useNavigate();
+
+  return (
+    <div className="admin">
+      <aside className="admin__sidebar">
+        <Logo to="/admin" light />
+        <nav className="admin__nav" aria-label="Admin">
+          {adminLinks.map(({ to, label, icon: Icon, end }) => (
+            <NavLink key={to} to={to} end={end} className={({ isActive }) => (isActive ? 'active' : '')}>
+              <Icon size={18} />
+              <span>{label}</span>
+            </NavLink>
+          ))}
+        </nav>
+        <div className="admin__footer">
+          <NavLink to="/dashboard"><ArrowLeft size={18} /><span>Back to site</span></NavLink>
+          <button onClick={() => { logout(); navigate('/'); }}><LogOut size={18} /><span>Sign out</span></button>
+          <p className="admin__who">{user.name}</p>
+        </div>
+      </aside>
+      <div className="admin__content">
+        <Outlet />
+      </div>
+    </div>
+  );
+}
+=== FILE: F:\Parqco_third\parqco\frontend\src\components\BookingConfirmation.jsx
+import { Link } from 'react-router-dom';
+import { CheckCircle2 } from 'lucide-react';
+import SlipButton from './SlipButton.jsx';
+
+/** Shown right after a booking succeeds: the challan with driver name and vehicle registration number. */
+export default function BookingConfirmation({ slip, bookingId, onBookAnother }) {
+  const rows = [
+    ['Driver name', slip.driverName],
+    ['Vehicle reg. no.', slip.vehicleNumber],
+    ['Slot', `${slip.slotId} · Floor ${slip.floor} · ${slip.zone}`],
+    ['Arrive', slip.start],
+    ['Leave', slip.end],
+    ['Duration', slip.duration],
+    ['Amount', slip.amount],
+  ];
+
+  return (
+    <div className="container page">
+      <section className="card receipt">
+        <CheckCircle2 size={40} className="receipt__icon" />
+        <h1>Booking confirmed</h1>
+        <p className="muted">Show this challan at the parking entrance. A copy was also sent to {slip.email}.</p>
+
+        <div className="receipt__challan">
+          <span>Challan number</span>
+          <strong>{slip.challanNumber}</strong>
+        </div>
+
+        <dl className="summary__list receipt__list">
+          {rows.map(([label, value]) => (
+            <div key={label}><dt>{label}</dt><dd>{value}</dd></div>
+          ))}
+        </dl>
+
+        <div className="receipt__actions">
+          <SlipButton bookingId={bookingId} challanNumber={slip.challanNumber} className="btn btn-primary" label="Download slip (PDF)" />
+          <Link to="/bookings" className="btn btn-ghost">My bookings</Link>
+          <button type="button" className="btn btn-ghost" onClick={onBookAnother}>Book another slot</button>
+        </div>
+      </section>
+    </div>
+  );
+}
+=== FILE: F:\Parqco_third\parqco\frontend\src\components\Navbar.jsx
+import { useState } from 'react';
+import { Link, NavLink, useNavigate } from 'react-router-dom';
+import { Menu, X } from 'lucide-react';
+import Logo from './Logo.jsx';
+import { useAuth } from '../context/AuthContext.jsx';
+
+export default function Navbar() {
+  const { user, logout } = useAuth();
+  const navigate = useNavigate();
+  const [open, setOpen] = useState(false);
+
+  const handleLogout = () => {
+    logout();
+    setOpen(false);
+    navigate('/');
+  };
+
+  const links = user
+    ? [
+        { to: '/dashboard', label: 'Live lot' },
+        { to: '/book', label: 'Book a slot' },
+        { to: '/bookings', label: 'My bookings' },
+        { to: '/predictions', label: 'Forecast' },
+        ...(user.role === 'admin' ? [{ to: '/admin', label: 'Admin' }] : []),
+      ]
+    : [];
+
+  return (
+    <header className="navbar">
+      <div className="container navbar__inner">
+        <Logo />
+
+        <nav className={`navbar__links ${open ? 'is-open' : ''}`} aria-label="Main">
+          {links.map((link) => (
+            <NavLink key={link.to} to={link.to} onClick={() => setOpen(false)} className={({ isActive }) => (isActive ? 'active' : '')}>
+              {link.label}
+            </NavLink>
+          ))}
+
+          <div className="navbar__actions">
+            {user ? (
+              <>
+                <span className="navbar__user">{user.name}</span>
+                <button className="btn btn-ghost btn-sm" onClick={handleLogout}>Sign out</button>
+              </>
+            ) : (
+              <>
+                <Link to="/login" className="btn btn-ghost btn-sm" onClick={() => setOpen(false)}>Sign in</Link>
+                <Link to="/register" className="btn btn-primary btn-sm" onClick={() => setOpen(false)}>Create account</Link>
+              </>
+            )}
+          </div>
+        </nav>
+
+        <button className="navbar__toggle" onClick={() => setOpen(!open)} aria-label="Toggle menu" aria-expanded={open}>
+          {open ? <X size={22} /> : <Menu size={22} />}
+        </button>
+      </div>
+    </header>
+  );
+}
+=== FILE: F:\Parqco_third\parqco\frontend\src\main.jsx
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import { BrowserRouter } from 'react-router-dom';
+import App from './App.jsx';
+import { AuthProvider } from './context/AuthContext.jsx';
+import './styles/global.css';
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    <BrowserRouter>
+      <AuthProvider>
+        <App />
+      </AuthProvider>
+    </BrowserRouter>
+  </React.StrictMode>
+);
+=== FILE: F:\Parqco_third\parqco\frontend\src\pages\admin\AdminBookings.jsx
+import { useCallback, useEffect, useState } from 'react';
+import api from '../../api/client.js';
+import PageHeader from '../../components/PageHeader.jsx';
+import DataTable from '../../components/DataTable.jsx';
+import SlipButton from '../../components/SlipButton.jsx';
+import { Alert, Loading } from '../../components/Feedback.jsx';
+import { errorMessage, formatDateTime, formatMoney } from '../../utils/format.js';
+
+export default function AdminBookings() {
+  const [bookings, setBookings] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+
+  const load = useCallback(async () => {
+    try {
+      setBookings((await api.get('/bookings')).data.bookings);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const cancel = async (booking) => {
+    if (!window.confirm(`Cancel booking for slot ${booking.slotId}?`)) return;
+    try {
+      await api.delete(`/bookings/${booking._id}`);
+      load();
+    } catch (err) {
+      setError(errorMessage(err));
+    }
+  };
+
+  if (loading) return <Loading />;
+
+  const columns = [
+    { header: 'Challan', render: (b) => b.challanNumber || '–' },
+    { header: 'Driver', render: (b) => <><strong>{b.driverName || b.user?.name || 'Deleted user'}</strong><br /><span className="muted small">{b.user?.email}</span></> },
+    { header: 'Slot', render: (b) => b.slotId },
+    { header: 'Vehicle', render: (b) => b.vehiclePlate || '–' },
+    { header: 'Time', render: (b) => `${formatDateTime(b.startTime)} to ${formatDateTime(b.endTime)}` },
+    { header: 'Amount', render: (b) => formatMoney(b.amount) },
+    { header: 'Status', render: (b) => <span className={`pill pill--${b.status}`}>{b.status}</span> },
+    { header: 'Actions', render: (b) => (
+      <>
+        <SlipButton bookingId={b._id} challanNumber={b.challanNumber} />
+        {b.status === 'confirmed' && <button className="btn btn-ghost btn-sm" onClick={() => cancel(b)}>Cancel</button>}
+      </>
+    ) },
+  ];
+
+  return (
+    <>
+      <PageHeader title="Bookings" subtitle="The 200 most recent reservations." />
+      <Alert>{error}</Alert>
+      <DataTable columns={columns} rows={bookings} emptyTitle="No bookings yet" />
+    </>
+  );
+}
+=== FILE: F:\Parqco_third\parqco\frontend\src\pages\admin\AdminOverview.jsx
+import { useEffect, useState } from 'react';
+import { Cell, Pie, PieChart, ResponsiveContainer, Tooltip } from 'recharts';
+import { Banknote, CalendarCheck, ParkingSquare, Users } from 'lucide-react';
+import api from '../../api/client.js';
+import PageHeader from '../../components/PageHeader.jsx';
+import StatCard from '../../components/StatCard.jsx';
+import { Alert, Loading } from '../../components/Feedback.jsx';
+import { errorMessage, formatDateTime, formatMoney } from '../../utils/format.js';
+
+const COLORS = { Available: '#1F9D6B', Occupied: '#D64545', Reserved: '#3B6FD4', Maintenance: '#9AA0A6' };
+
+export default function AdminOverview() {
+  const [stats, setStats] = useState(null);
+  const [sensors, setSensors] = useState([]);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    Promise.all([api.get('/admin/stats'), api.get('/sensors')])
+      .then(([statsResponse, sensorResponse]) => {
+        setStats(statsResponse.data.stats);
+        setSensors(sensorResponse.data.sensors);
+      })
+      .catch((err) => setError(errorMessage(err)));
+  }, []);
+
+  if (error) return <Alert>{error}</Alert>;
+  if (!stats) return <Loading />;
+
+  const chartData = [
+    { name: 'Available', value: stats.available },
+    { name: 'Occupied', value: stats.occupied },
+    { name: 'Reserved', value: stats.reserved },
+    { name: 'Maintenance', value: stats.maintenance },
+  ].filter((entry) => entry.value > 0);
+
+  const sensorsOnline = sensors.filter((sensor) => sensor.online).length;
+  const utilisation = stats.totalSlots ? Math.round(((stats.occupied + stats.reserved) / stats.totalSlots) * 100) : 0;
+
+  return (
+    <>
+      <PageHeader title="Overview" subtitle="How the lot is doing right now." />
+
+      <div className="stats stats--five">
+        <StatCard label="Total slots" value={stats.totalSlots} icon={ParkingSquare} note={`${utilisation}% in use`} />
+        <StatCard label="Bookings today" value={stats.bookingsToday} icon={CalendarCheck} />
+        <StatCard label="Drivers" value={stats.users} icon={Users} />
+        <StatCard label="Revenue" value={formatMoney(stats.revenue)} icon={Banknote} tone="free" note="Confirmed and completed" />
+        <StatCard label="Sensors online" value={`${sensorsOnline}/${sensors.length}`} tone={sensorsOnline === sensors.length ? 'free' : 'busy'} />
+      </div>
+
+      <div className="two-col">
+        <section className="card">
+          <h2>Slot status</h2>
+          <div className="donut">
+            <ResponsiveContainer width="100%" height={220}>
+              <PieChart>
+                <Pie data={chartData} dataKey="value" nameKey="name" innerRadius={62} outerRadius={92} paddingAngle={2}>
+                  {chartData.map((entry) => <Cell key={entry.name} fill={COLORS[entry.name]} />)}
+                </Pie>
+                <Tooltip />
+              </PieChart>
+            </ResponsiveContainer>
+            <ul className="legend legend--column">
+              {chartData.map((entry) => (
+                <li key={entry.name}><i className="legend__dot" style={{ background: COLORS[entry.name] }} />{entry.name}: <strong>{entry.value}</strong></li>
+              ))}
+            </ul>
+          </div>
+        </section>
+
+        <section className="card">
+          <h2>Recent bookings</h2>
+          {stats.recentBookings.length === 0 ? (
+            <p className="muted">No bookings yet.</p>
+          ) : (
+            <ul className="mini-list">
+              {stats.recentBookings.map((booking) => (
+                <li key={booking._id}>
+                  <strong>{booking.slotId} · {booking.user?.name || 'Unknown'}</strong>
+                  <span>{formatDateTime(booking.startTime)}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      </div>
+    </>
+  );
+}
+=== FILE: F:\Parqco_third\parqco\frontend\src\pages\BookSlot.jsx
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import api from '../api/client.js';
+import { useAuth } from '../context/AuthContext.jsx';
+import BookingConfirmation from '../components/BookingConfirmation.jsx';
+import PageHeader from '../components/PageHeader.jsx';
+import FloorTabs from '../components/FloorTabs.jsx';
+import ParkingLot from '../components/ParkingLot.jsx';
+import Legend from '../components/Legend.jsx';
+import { Alert } from '../components/Feedback.jsx';
+import { errorMessage, formatDateTime, formatMoney, roundUpToNextHalfHour, toInputValue } from '../utils/format.js';
+
+const DURATIONS = [1, 2, 3, 4, 6, 8, 12, 24];
+
+export default function BookSlot() {
+  const { user } = useAuth();
+
+  const [start, setStart] = useState(toInputValue(roundUpToNextHalfHour()));
+  const [hours, setHours] = useState(2);
+  const [plate, setPlate] = useState('');
+  const [driverName, setDriverName] = useState(user?.name || '');
+  const [confirmation, setConfirmation] = useState(null); // { slip, bookingId } after a successful booking
+  const [floor, setFloor] = useState(1);
+  const [slots, setSlots] = useState([]);
+  const [selected, setSelected] = useState(null);
+  const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  // End time is always start + duration
+  const startDate = useMemo(() => new Date(start), [start]);
+  const endDate = useMemo(() => new Date(startDate.getTime() + hours * 60 * 60 * 1000), [startDate, hours]);
+
+  // Whenever the time window changes, ask the server which slots are free for it
+  const loadAvailability = useCallback(() => {
+    if (Number.isNaN(startDate.getTime())) return;
+    api
+      .get('/slots/availability', { params: { start: startDate.toISOString(), end: endDate.toISOString() } })
+      .then((response) => {
+        setSlots(response.data.slots);
+        setSelected((current) => (current && response.data.slots.find((s) => s.slotId === current.slotId && s.bookable) ? current : null));
+      })
+      .catch((err) => setError(errorMessage(err)));
+  }, [startDate, endDate]);
+
+  useEffect(() => { loadAvailability(); }, [loadAvailability]);
+
+  const floors = useMemo(() => [...new Set(slots.map((slot) => slot.floor))].sort(), [slots]);
+  const floorSlots = slots.filter((slot) => slot.floor === floor);
+  const freeCount = slots.filter((slot) => slot.bookable).length;
+  const total = selected ? hours * selected.hourlyRate : 0;
+
+  const handleConfirm = async () => {
+    setError('');
+    setSubmitting(true);
+    try {
+      const { data } = await api.post('/bookings', {
+        slotId: selected.slotId,
+        startTime: startDate.toISOString(),
+        endTime: endDate.toISOString(),
+        vehiclePlate: plate,
+        driverName: driverName.trim() || undefined,
+      });
+      setConfirmation({ slip: data.slip, bookingId: data.booking._id });
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const bookAnother = () => {
+    setConfirmation(null);
+    setSelected(null);
+    setPlate('');
+    loadAvailability(); // the slot just booked must now show as taken
+  };
+
+  if (confirmation) return <BookingConfirmation {...confirmation} onBookAnother={bookAnother} />;
+
+  const canConfirm = selected && plate.trim().length >= 3 && !submitting;
+
+  return (
+    <div className="container page">
+      <PageHeader title="Book a slot" subtitle="Choose when you will arrive, then pick a free bay." />
+
+      <div className="booking-grid">
+        <div className="stack">
+          <section className="card">
+            <h2>When do you need it?</h2>
+            <div className="form form--row">
+              <label className="field">
+                <span>Arrival</span>
+                <input className="input" type="datetime-local" value={start} min={toInputValue(new Date())} onChange={(e) => setStart(e.target.value)} />
+              </label>
+              <label className="field">
+                <span>Duration</span>
+                <select className="input" value={hours} onChange={(e) => setHours(Number(e.target.value))}>
+                  {DURATIONS.map((value) => <option key={value} value={value}>{value} {value === 1 ? 'hour' : 'hours'}</option>)}
+                </select>
+              </label>
+              <label className="field">
+                <span>Driver name</span>
+                <input className="input" autoComplete="name" placeholder="Name on the challan" value={driverName} maxLength={80} onChange={(e) => setDriverName(e.target.value)} />
+              </label>
+              <label className="field">
+                <span>Vehicle registration number</span>
+                <input className="input" placeholder="LEA-1234" value={plate} maxLength={12} onChange={(e) => setPlate(e.target.value.toUpperCase())} />
+              </label>
+            </div>
+          </section>
+
+          <section className="card">
+            <div className="card__head">
+              <h2>Pick a bay <small>{freeCount} free for this time</small></h2>
+              <FloorTabs floors={floors} active={floor} onChange={setFloor} />
+            </div>
+            <ParkingLot
+              slots={floorSlots}
+              selectedId={selected?.slotId}
+              onSelect={setSelected}
+              isDisabled={(slot) => !slot.bookable}
+              getStatus={(slot) => (slot.bookable ? 'available' : slot.status === 'maintenance' ? 'maintenance' : slot.unavailableReason === 'Occupied now' ? 'occupied' : 'reserved')}
+              getHint={(slot) => (slot.bookable ? `Available · ${formatMoney(slot.hourlyRate)}/hour` : slot.unavailableReason)}
+            />
+            <Legend items={['available', 'occupied', 'reserved', 'selected']} />
+          </section>
+        </div>
+
+        <aside className="summary card">
+          <h2>Booking summary</h2>
+          {selected ? (
+            <dl className="summary__list">
+              <div><dt>Slot</dt><dd>{selected.slotId} · {selected.zone}</dd></div>
+              <div><dt>Arrive</dt><dd>{formatDateTime(startDate)}</dd></div>
+              <div><dt>Leave</dt><dd>{formatDateTime(endDate)}</dd></div>
+              <div><dt>Rate</dt><dd>{formatMoney(selected.hourlyRate)} / hour</dd></div>
+              <div className="summary__total"><dt>Total</dt><dd>{formatMoney(total)}</dd></div>
+            </dl>
+          ) : (
+            <p className="muted">Select a free bay on the map to see your price.</p>
+          )}
+          <Alert>{error}</Alert>
+          <button className="btn btn-primary btn-block" disabled={!canConfirm} onClick={handleConfirm}>
+            {submitting ? 'Booking…' : 'Confirm booking'}
+          </button>
+          {selected && plate.trim().length < 3 && <p className="muted small">Enter your vehicle registration number to continue.</p>}
+        </aside>
+      </div>
+    </div>
+  );
+}
+=== FILE: F:\Parqco_third\parqco\frontend\src\pages\Dashboard.jsx
+import { useEffect, useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
+import { CarFront, CircleCheck, Clock, Gauge } from 'lucide-react';
+import api from '../api/client.js';
+import { useAuth } from '../context/AuthContext.jsx';
+import { useLiveSlots } from '../components/useLiveSlots.js';
+import PageHeader from '../components/PageHeader.jsx';
+import StatCard from '../components/StatCard.jsx';
+import FloorTabs from '../components/FloorTabs.jsx';
+import ParkingLot from '../components/ParkingLot.jsx';
+import Legend from '../components/Legend.jsx';
+import ForecastChart from '../components/ForecastChart.jsx';
+import { Alert, Loading } from '../components/Feedback.jsx';
+import { formatDateTime } from '../utils/format.js';
+
+const greeting = () => {
+  const hour = new Date().getHours();
+  return hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
+};
+
+export default function Dashboard() {
+  const { user } = useAuth();
+  const { slots, loading, error, connected } = useLiveSlots();
+  const [floor, setFloor] = useState(1);
+  const [forecast, setForecast] = useState(null);
+  const [upcoming, setUpcoming] = useState([]);
+
+  // Forecast + the driver's next bookings (loaded once)
+  useEffect(() => {
+    api.get('/predictions/today').then((r) => setForecast(r.data.forecast)).catch(() => {});
+    api
+      .get('/bookings/my')
+      .then((r) => setUpcoming(r.data.bookings.filter((b) => b.status === 'confirmed').reverse().slice(0, 3)))
+      .catch(() => {});
+  }, []);
+
+  const floors = useMemo(() => [...new Set(slots.map((slot) => slot.floor))].sort(), [slots]);
+  const floorSlots = slots.filter((slot) => slot.floor === floor);
+  const count = (status) => slots.filter((slot) => slot.liveStatus === status).length;
+
+  if (loading) return <Loading label="Loading the live lot…" />;
+
+  return (
+    <div className="container page">
+      <PageHeader
+        title={`${greeting()}, ${user.name.split(' ')[0]}`}
+        subtitle="Here is what the lot looks like right now."
+        actions={
+          <>
+            <span className={`live-badge ${connected ? '' : 'is-offline'}`}><span className="live-dot" />{connected ? 'Live' : 'Reconnecting…'}</span>
+            <Link to="/book" className="btn btn-primary">Book a slot</Link>
+          </>
+        }
+      />
+      <Alert>{error}</Alert>
+
+      <div className="stats">
+        <StatCard label="Total slots" value={slots.length} icon={Gauge} />
+        <StatCard label="Available" value={count('available')} tone="free" icon={CircleCheck} />
+        <StatCard label="Occupied" value={count('occupied')} tone="busy" icon={CarFront} />
+        <StatCard label="Reserved" value={count('reserved')} tone="reserved" icon={Clock} />
+      </div>
+
+      <div className="dashboard-grid">
+        <section className="card">
+          <div className="card__head">
+            <h2>Live parking map</h2>
+            <FloorTabs floors={floors} active={floor} onChange={setFloor} />
+          </div>
+          <ParkingLot slots={floorSlots} getStatus={(slot) => slot.liveStatus} />
+          <Legend items={['available', 'occupied', 'reserved', 'maintenance']} />
+        </section>
+
+        <aside className="stack">
+          <section className="card">
+            <h2>Today’s forecast</h2>
+            {forecast ? (
+              <>
+                <p className="forecast-peak"><strong>{forecast.peak.occupancy}%</strong> full between {forecast.peak.label}</p>
+                <ForecastChart forecast={forecast} compact />
+                <Link to="/predictions" className="link">See the full forecast</Link>
+              </>
+            ) : (
+              <p className="muted">Loading forecast…</p>
+            )}
+          </section>
+
+          <section className="card">
+            <h2>Your next bookings</h2>
+            {upcoming.length === 0 ? (
+              <p className="muted">No upcoming bookings. <Link to="/book" className="link">Reserve a slot</Link></p>
+            ) : (
+              <ul className="mini-list">
+                {upcoming.map((booking) => (
+                  <li key={booking._id}>
+                    <strong>{booking.slotId}</strong>
+                    <span>{formatDateTime(booking.startTime)}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+        </aside>
+      </div>
+    </div>
+  );
+}
+=== FILE: F:\Parqco_third\parqco\frontend\src\pages\Landing.jsx
+import { useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
+import { Radio, MapPinned, CalendarCheck, LineChart, ShieldCheck, Smartphone } from 'lucide-react';
+import api from '../api/client.js';
+import { useAuth } from '../context/AuthContext.jsx';
+
+/** Turns the public summary numbers into a list of bay statuses for the hero illustration. */
+function buildHeroBays(summary, count = 20) {
+  if (!summary || !summary.total) return Array(count).fill('available');
+  const scale = count / summary.total;
+  const occupied = Math.round(summary.occupied * scale);
+  const reserved = Math.round(summary.reserved * scale);
+  const bays = [
+    ...Array(occupied).fill('occupied'),
+    ...Array(reserved).fill('reserved'),
+  ];
+  while (bays.length < count) bays.push('available');
+  // Interleave statuses (every 3rd bay first) so the grid does not look sorted
+  const order = Array.from({ length: count }, (_, i) => i).sort((x, y) => (x % 3) - (y % 3) || x - y);
+  const spread = Array(count);
+  order.forEach((position, i) => { spread[position] = bays[i]; });
+  return spread;
+}
+
+const steps = [
+  { icon: Radio, title: 'Sensors watch every bay', text: 'An ultrasonic sensor on each slot reports whether a car is there, within seconds.' },
+  { icon: MapPinned, title: 'You see the live map', text: 'The dashboard shows which bays are free on every floor, with no refresh needed.' },
+  { icon: CalendarCheck, title: 'Reserve your bay', text: 'Pick a time and a slot. Nobody else can book it for those hours.' },
+  { icon: LineChart, title: 'Plan with the forecast', text: 'Our model learns from past occupancy and tells you when the lot will be busy.' },
+];
+
+const features = [
+  { icon: Radio, title: 'Real-time slot detection', text: 'ESP32 boards and ultrasonic sensors push every change to the server instantly.' },
+  { icon: LineChart, title: 'AI peak-hour forecasts', text: 'Hourly occupancy predictions with a confidence score, based on four weeks of history.' },
+  { icon: Smartphone, title: 'Works on any screen', text: 'A responsive web app for drivers on phones and for staff at the front desk.' },
+  { icon: ShieldCheck, title: 'Admin control panel', text: 'Manage slots, bookings, users and sensor health from one place.' },
+];
+
+export default function Landing() {
+  const { user } = useAuth();
+  const [summary, setSummary] = useState(null);
+
+  useEffect(() => {
+    api.get('/slots/summary').then((response) => setSummary(response.data.summary)).catch(() => {});
+  }, []);
+
+  const bays = buildHeroBays(summary);
+  const primaryTarget = user ? '/dashboard' : '/register';
+
+  return (
+    <>
+      <section className="hero">
+        <div className="container hero__inner">
+          <div className="hero__copy">
+            <h1>Know which bay is free before you leave home.</h1>
+            <p>
+              PARQCO connects sensors in every parking slot to a live map, instant booking and an AI forecast of
+              the busiest hours. Less circling, less waiting, less traffic.
+            </p>
+            <div className="hero__cta">
+              <Link to={primaryTarget} className="btn btn-primary btn-lg">{user ? 'Open the live lot' : 'Create a free account'}</Link>
+              <Link to={user ? '/book' : '/login'} className="btn btn-outline btn-lg">{user ? 'Book a slot' : 'Sign in'}</Link>
+            </div>
+            {summary && (
+              <dl className="hero__numbers">
+                <div><dt>Free right now</dt><dd>{summary.available}</dd></div>
+                <div><dt>Occupied</dt><dd>{summary.occupied}</dd></div>
+                <div><dt>Reserved</dt><dd>{summary.reserved}</dd></div>
+              </dl>
+            )}
+          </div>
+
+          <div className="hero__board" aria-hidden="true">
+            <div className="hero__board-head">
+              <span className="live-dot" /> Live lot preview
+            </div>
+            <div className="hero__bays">
+              {bays.map((status, index) => (
+                <span key={index} className={`mini-bay mini-bay--${status}`} style={{ animationDelay: `${index * 45}ms` }} />
+              ))}
+            </div>
+            <div className="hero__board-foot">Drawn from this lot’s real occupancy</div>
+          </div>
+        </div>
+      </section>
+
+      <section className="section">
+        <div className="container">
+          <h2 className="section__title">From sensor to your screen in four steps</h2>
+          <ol className="steps">
+            {steps.map(({ icon: Icon, title, text }, index) => (
+              <li key={title} className="steps__item">
+                <span className="steps__number">{index + 1}</span>
+                <Icon size={22} />
+                <h3>{title}</h3>
+                <p>{text}</p>
+              </li>
+            ))}
+          </ol>
+        </div>
+      </section>
+
+      <section className="section section--tint">
+        <div className="container features">
+          <div>
+            <h2 className="section__title">Built for lots that are always busy</h2>
+            <p className="section__lead">Universities, malls, hospitals and offices use PARQCO to keep drivers moving and to understand how their parking is really used.</p>
+          </div>
+          <ul className="features__list">
+            {features.map(({ icon: Icon, title, text }) => (
+              <li key={title}>
+                <Icon size={22} />
+                <div>
+                  <h3>{title}</h3>
+                  <p>{text}</p>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </div>
+      </section>
+
+      <section className="section">
+        <div className="container cta-band">
+          <h2>Ready to stop circling the car park?</h2>
+          <Link to={primaryTarget} className="btn btn-primary btn-lg">{user ? 'Go to dashboard' : 'Get started'}</Link>
+        </div>
+      </section>
+    </>
+  );
+}
+=== FILE: F:\Parqco_third\parqco\frontend\src\pages\Login.jsx
+import { useState } from 'react';
+import { Link, useLocation, useNavigate } from 'react-router-dom';
+import AuthShell from '../components/AuthShell.jsx';
+import { Alert } from '../components/Feedback.jsx';
+import { useAuth } from '../context/AuthContext.jsx';
+import { errorMessage } from '../utils/format.js';
+
+export default function Login() {
+  const { login } = useAuth();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const [form, setForm] = useState({ email: '', password: '' });
+  const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  // Set by the Register and ForgotPassword pages after they finish.
+  const notice = location.state?.registered
+    ? 'Account created. Sign in to continue.'
+    : location.state?.reset
+      ? 'Password updated. Sign in with your new password.'
+      : '';
+
+  const update = (field) => (event) => setForm({ ...form, [field]: event.target.value });
+
+  const handleSubmit = async (event) => {
+    event.preventDefault();
+    setError('');
+    setSubmitting(true);
+    try {
+      const user = await login(form.email, form.password);
+      navigate(user.role === 'admin' ? '/admin' : '/dashboard');
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const fillDemo = (email, password) => setForm({ email, password });
+
+  return (
+    <AuthShell
+      title="Welcome back"
+      subtitle="Sign in to see the live lot and manage your bookings."
+      footer={<>New to PARQCO? <Link to="/register">Create an account</Link></>}
+    >
+      <form onSubmit={handleSubmit} className="form" noValidate>
+        {notice && <p role="status" style={{ color: '#067647', margin: 0 }}>{notice}</p>}
+        <Alert>{error}</Alert>
+        <label className="field">
+          <span>Email</span>
+          <input className="input" type="email" autoComplete="email" placeholder="you@example.com" value={form.email} onChange={update('email')} required />
+        </label>
+        <label className="field">
+          <span>Password</span>
+          <input className="input" type="password" autoComplete="current-password" placeholder="Your password" value={form.password} onChange={update('password')} required />
+        </label>
+        <div style={{ textAlign: 'right', marginTop: '-0.25rem' }}>
+          <Link to="/forgot-password">Forgot password?</Link>
+        </div>
+        <button className="btn btn-primary btn-block" disabled={submitting}>{submitting ? 'Signing in…' : 'Sign in'}</button>
+      </form>
+
+      <div className="demo-box">
+        <p>Trying it locally? Use a demo account:</p>
+        <div>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => fillDemo('demo@parqco.com', 'Demo@123')}>Demo driver</button>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => fillDemo('admin@parqco.com', 'Admin@123')}>Admin</button>
+        </div>
+      </div>
+    </AuthShell>
+  );
+}
+=== FILE: F:\Parqco_third\parqco\frontend\src\pages\MyBookings.jsx
+import { useCallback, useEffect, useState } from 'react';
+import { Link, useLocation } from 'react-router-dom';
+import api from '../api/client.js';
+import PageHeader from '../components/PageHeader.jsx';
+import { Alert, EmptyState, Loading } from '../components/Feedback.jsx';
+import SlipButton from '../components/SlipButton.jsx';
+import { errorMessage, formatDateTime, formatMoney } from '../utils/format.js';
+
+export default function MyBookings() {
+  const location = useLocation();
+  const [bookings, setBookings] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [tab, setTab] = useState('upcoming');
+  const [error, setError] = useState('');
+  const [message, setMessage] = useState(location.state?.message || '');
+
+  const load = useCallback(async () => {
+    try {
+      const { data } = await api.get('/bookings/my');
+      setBookings(data.bookings);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const cancel = async (booking) => {
+    if (!window.confirm(`Cancel your booking for slot ${booking.slotId}?`)) return;
+    setError('');
+    try {
+      await api.delete(`/bookings/${booking._id}`);
+      setMessage('Booking cancelled.');
+      load();
+    } catch (err) {
+      setError(errorMessage(err));
+    }
+  };
+
+  const visible = bookings.filter((booking) => (tab === 'upcoming' ? booking.status === 'confirmed' : booking.status !== 'confirmed'));
+
+  if (loading) return <Loading />;
+
+  return (
+    <div className="container page">
+      <PageHeader title="My bookings" subtitle="Reservations you have made." actions={<Link to="/book" className="btn btn-primary">New booking</Link>} />
+      <Alert type="success">{message}</Alert>
+      <Alert>{error}</Alert>
+
+      <div className="tabs" role="tablist">
+        <button role="tab" aria-selected={tab === 'upcoming'} className={tab === 'upcoming' ? 'active' : ''} onClick={() => setTab('upcoming')}>Upcoming</button>
+        <button role="tab" aria-selected={tab === 'past'} className={tab === 'past' ? 'active' : ''} onClick={() => setTab('past')}>Past and cancelled</button>
+      </div>
+
+      {visible.length === 0 ? (
+        <EmptyState
+          title={tab === 'upcoming' ? 'No upcoming bookings' : 'Nothing here yet'}
+          message={tab === 'upcoming' ? 'Reserve a bay and it will show up here.' : 'Completed and cancelled bookings appear here.'}
+          action={tab === 'upcoming' ? <Link to="/book" className="btn btn-primary">Book a slot</Link> : null}
+        />
+      ) : (
+        <ul className="booking-list">
+          {visible.map((booking) => (
+            <li key={booking._id} className="booking-item">
+              <div className="booking-item__slot">{booking.slotId}</div>
+              <div className="booking-item__info">
+                <strong>{formatDateTime(booking.startTime)} to {formatDateTime(booking.endTime)}</strong>
+                <span>{booking.challanNumber || 'Challan pending'} · {booking.vehiclePlate || 'No vehicle number'} · {formatMoney(booking.amount)}</span>
+                {booking.driverName && <span>Driver: {booking.driverName}</span>}
+              </div>
+              <span className={`pill pill--${booking.status}`}>{booking.status}</span>
+              <SlipButton bookingId={booking._id} challanNumber={booking.challanNumber} />
+              {booking.status === 'confirmed' && <button className="btn btn-ghost btn-sm" onClick={() => cancel(booking)}>Cancel</button>}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}

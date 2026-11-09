@@ -1,0 +1,16 @@
+.otp-row { display: flex; gap: 8px; justify-content: space-between; }
+.otp-box {
+  width: 100%;
+  max-width: 54px;
+  aspect-ratio: 1 / 1.15;
+  text-align: center;
+  font-size: 1.4rem;
+  font-weight: 700;
+  color: inherit;
+  background: transparent;
+  border: 1px solid currentColor;
+  border-radius: 8px;
+  opacity: 0.9;
+}
+.otp-box:focus-visible { outline: 3px solid rgba(23, 71, 201, 0.4); opacity: 1; }
+@media (max-width: 380px) { .otp-row { gap: 5px; } }

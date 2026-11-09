@@ -1,0 +1,9 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    { "label": "PARQCO: install everything", "type": "shell", "command": "npm run install:all", "problemMatcher": [] },
+    { "label": "PARQCO: run (API + website)", "type": "shell", "command": "npm run dev", "problemMatcher": [], "isBackground": true },
+    { "label": "PARQCO: reset demo data", "type": "shell", "command": "npm run seed", "problemMatcher": [] },
+    { "label": "PARQCO: simulate sensors", "type": "shell", "command": "npm run simulate", "problemMatcher": [], "isBackground": true }
+  ]
+}

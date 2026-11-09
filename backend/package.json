@@ -1,0 +1,37 @@
+{
+  "name": "parqco-backend",
+  "version": "1.0.0",
+  "description": "PARQCO Smart Parking – REST API, IoT ingestion and ML forecasting",
+  "type": "module",
+  "main": "src/server.js",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "nodemon src/server.js",
+    "start": "node src/server.js",
+    "seed": "node src/utils/seed.js",
+    "simulate": "node scripts/simulate-sensors.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^8.7.1",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.3",
+    "mongoose": "^8.4.0",
+    "morgan": "^1.10.0",
+    "nodemailer": "^10.2.1",
+    "pdf-lib": "^1.17.1",
+    "pdfkit": "^0.20.2",
+    "socket.io": "^4.7.5",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "mongodb-memory-server": "^9.4.0",
+    "nodemon": "^3.1.0"
+  }
+}
